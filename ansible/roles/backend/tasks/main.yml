@@ -1,0 +1,78 @@
+---
+- name: Add NodeSource repository for Node.js 20
+  ansible.builtin.shell: |
+    set -o pipefail
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  args:
+    executable: /bin/bash
+    creates: /etc/apt/sources.list.d/nodesource.list
+
+- name: Install Node.js
+  ansible.builtin.apt:
+    name: nodejs
+    state: present
+    update_cache: true
+
+- name: Create application directory
+  ansible.builtin.file:
+    path: "{{ app_dir }}"
+    state: directory
+    owner: "{{ app_user }}"
+    group: "{{ app_user }}"
+    mode: '0755'
+
+# Runs from the control machine (no delegate_to). config/config.json is
+# excluded so the templated production config below isn't overwritten.
+- name: Deploy EpicBook application code
+  ansible.posix.synchronize:
+    src: "{{ playbook_dir }}/../"
+    dest: "{{ app_dir }}/"
+    rsync_opts:
+      - "--exclude=.git"
+      - "--exclude=ansible"
+      - "--exclude=ansible.cfg"
+      - "--exclude=node_modules"
+      - "--exclude=config/config.json"
+      - "--exclude=azure-pipelines.yml"
+      - "--chown={{ app_user }}:{{ app_user }}"
+  register: app_code
+  notify: Restart epicbook
+
+- name: Check for installed Node.js dependencies
+  ansible.builtin.stat:
+    path: "{{ app_dir }}/node_modules"
+  register: node_modules_dir
+
+- name: Install Node.js dependencies
+  ansible.builtin.command: npm ci --omit=dev
+  args:
+    chdir: "{{ app_dir }}"
+  become_user: "{{ app_user }}"
+  when: app_code is changed or not node_modules_dir.stat.exists
+  notify: Restart epicbook
+
+- name: Deploy database configuration
+  ansible.builtin.template:
+    src: db-config.j2
+    dest: "{{ app_dir }}/config/config.json"
+    owner: "{{ app_user }}"
+    group: "{{ app_user }}"
+    mode: '0600'
+  no_log: true
+  notify: Restart epicbook
+
+- name: Deploy systemd service unit
+  ansible.builtin.template:
+    src: epicbook.service.j2
+    dest: /etc/systemd/system/epicbook.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Restart epicbook
+
+- name: Enable and start EpicBook service
+  ansible.builtin.systemd:
+    name: epicbook
+    enabled: true
+    state: started
+    daemon_reload: true
