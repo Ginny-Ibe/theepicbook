@@ -1,19 +1,225 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
+# EpicBook Application Pipeline
+# Configures the two EC2 instances and deploys EpicBook with Ansible:
+#   Prepare -> Validate -> Configure and Deploy -> Verify
 
 trigger:
-- main
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - server.js
+      - package.json
+      - package-lock.json
+      - routes
+      - models
+      - views
+      - public
+      - config
+      - db
+      - ansible
+      - ansible.cfg
+      - azure-pipelines.yml
 
+pr: none
+
+variables:
+  # mysqlAdminUsername / mysqlAdminPassword (secret)
+  - group: Epicbook-mysql-secrets
+
+  # Secure File holding the SSH private key for both EC2 hosts
+  - name: sshKeySecureFile
+    value: terraform-aws-epicbook-vm-key
+
+  # Agent runs Python 3.10, and ansible-core 2.17 is the last release that
+  # supports a 3.10 controller
+  - name: ansibleCoreVersion
+    value: '2.17.*'
+
+  - name: inventory
+    value: ansible/inventory/hosts.ini
+
+  - name: playbook
+    value: ansible/site.yml
+
+# Self-hosted agent (SelfHostedAgentVM): the organization has no
+# Microsoft-hosted parallelism, and the EC2 security groups only allow SSH
+# from this agent's static IP.
 pool:
-  vmImage: ubuntu-latest
+  name: StaticSiteAgentPool
 
-steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
+stages:
+  # ---------------------------------------------------------------------------
+  - stage: Prepare
+    displayName: 'Prepare'
+    jobs:
+      - job: prepare
+        displayName: 'Install Ansible and fetch SSH key'
+        steps:
+          - checkout: self
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
+          # Ansible goes into a throwaway venv in the agent temp dir (cleaned
+          # after every job), so nothing is installed system-wide on the agent.
+          - script: |
+              set -euo pipefail
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv rsync >/dev/null
+              python3 -m venv "$(Agent.TempDirectory)/ansible-venv"
+              "$(Agent.TempDirectory)/ansible-venv/bin/pip" install -q --upgrade pip
+              "$(Agent.TempDirectory)/ansible-venv/bin/pip" install -q "ansible-core==$(ansibleCoreVersion)" PyMySQL
+              echo "##vso[task.prependpath]$(Agent.TempDirectory)/ansible-venv/bin"
+            displayName: 'Install Ansible $(ansibleCoreVersion)'
+
+          - script: |
+              set -euo pipefail
+              ansible-galaxy collection install community.mysql ansible.posix
+              ansible --version | head -1
+            displayName: 'Install community.mysql and ansible.posix'
+
+          - task: DownloadSecureFile@1
+            name: sshKey
+            displayName: 'Download SSH private key'
+            inputs:
+              secureFile: $(sshKeySecureFile)
+
+          # Copy to a fixed name in the agent temp dir with 0600; the agent
+          # deletes the temp dir after the job. Never printed or published.
+          - script: |
+              set -euo pipefail
+              install -m 600 "$(sshKey.secureFilePath)" "$(Agent.TempDirectory)/epicbook_ssh_key"
+              echo "SSH key ready with 0600 permissions"
+            displayName: 'Secure SSH key permissions'
+
+  # ---------------------------------------------------------------------------
+  - stage: Validate
+    displayName: 'Validate'
+    dependsOn: Prepare
+    jobs:
+      - job: validate
+        displayName: 'Inventory, syntax and connectivity checks'
+        steps:
+          - checkout: self
+
+          # Each stage gets a fresh job with its own temp dir and no shared
+          # filesystem, so Ansible is reinstalled and the key re-downloaded.
+          - script: |
+              set -euo pipefail
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv rsync >/dev/null
+              python3 -m venv "$(Agent.TempDirectory)/ansible-venv"
+              "$(Agent.TempDirectory)/ansible-venv/bin/pip" install -q --upgrade pip
+              "$(Agent.TempDirectory)/ansible-venv/bin/pip" install -q "ansible-core==$(ansibleCoreVersion)" PyMySQL
+              echo "##vso[task.prependpath]$(Agent.TempDirectory)/ansible-venv/bin"
+            displayName: 'Install Ansible $(ansibleCoreVersion)'
+
+          - script: ansible-galaxy collection install community.mysql ansible.posix
+            displayName: 'Install community.mysql and ansible.posix'
+
+          - task: DownloadSecureFile@1
+            name: sshKey
+            displayName: 'Download SSH private key'
+            inputs:
+              secureFile: $(sshKeySecureFile)
+
+          - script: install -m 600 "$(sshKey.secureFilePath)" "$(Agent.TempDirectory)/epicbook_ssh_key"
+            displayName: 'Secure SSH key permissions'
+
+          - script: ansible-inventory -i $(inventory) --graph
+            displayName: 'Validate inventory'
+
+          - script: ansible-playbook -i $(inventory) $(playbook) --syntax-check
+            displayName: 'Playbook syntax check'
+
+          - script: |
+              set -euo pipefail
+              if ! ansible -i $(inventory) all -m ping --private-key "$(Agent.TempDirectory)/epicbook_ssh_key"; then
+                echo "##vso[task.logissue type=error]One or more hosts are unreachable over SSH. Check the security groups allow this agent's IP and that the hosts are running."
+                exit 1
+              fi
+            displayName: 'Ansible ping all hosts'
+
+  # ---------------------------------------------------------------------------
+  - stage: Deploy
+    displayName: 'Configure and Deploy'
+    dependsOn: Validate
+    jobs:
+      - job: deploy
+        displayName: 'Run site.yml'
+        steps:
+          - checkout: self
+
+          - script: |
+              set -euo pipefail
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv rsync >/dev/null
+              python3 -m venv "$(Agent.TempDirectory)/ansible-venv"
+              "$(Agent.TempDirectory)/ansible-venv/bin/pip" install -q --upgrade pip
+              "$(Agent.TempDirectory)/ansible-venv/bin/pip" install -q "ansible-core==$(ansibleCoreVersion)" PyMySQL
+              echo "##vso[task.prependpath]$(Agent.TempDirectory)/ansible-venv/bin"
+            displayName: 'Install Ansible $(ansibleCoreVersion)'
+
+          - script: ansible-galaxy collection install community.mysql ansible.posix
+            displayName: 'Install community.mysql and ansible.posix'
+
+          - task: DownloadSecureFile@1
+            name: sshKey
+            displayName: 'Download SSH private key'
+            inputs:
+              secureFile: $(sshKeySecureFile)
+
+          - script: install -m 600 "$(sshKey.secureFilePath)" "$(Agent.TempDirectory)/epicbook_ssh_key"
+            displayName: 'Secure SSH key permissions'
+
+          # Credentials reach Ansible only through env: (secret variables are
+          # not exposed to scripts otherwise) and are never echoed. The roles
+          # mark every task that uses them no_log: true.
+          - script: |
+              set -euo pipefail
+              ansible-playbook -i $(inventory) $(playbook) \
+                --private-key "$(Agent.TempDirectory)/epicbook_ssh_key" \
+                -e "db_admin_username=${DB_ADMIN_USERNAME}" \
+                -e "db_admin_password=${DB_ADMIN_PASSWORD}" \
+                | tee "$(Agent.TempDirectory)/ansible-run.log"
+              # Keep only the play recap (no task output) for the Verify stage
+              sed -n '/^PLAY RECAP/,$p' "$(Agent.TempDirectory)/ansible-run.log" > "$(Build.ArtifactStagingDirectory)/play-recap.txt"
+            displayName: 'Run ansible-playbook site.yml'
+            env:
+              DB_ADMIN_USERNAME: $(mysqlAdminUsername)
+              DB_ADMIN_PASSWORD: $(mysqlAdminPassword)
+
+          - publish: $(Build.ArtifactStagingDirectory)/play-recap.txt
+            artifact: play-recap
+            displayName: 'Publish play recap'
+            condition: succeededOrFailed()
+
+  # ---------------------------------------------------------------------------
+  - stage: Verify
+    displayName: 'Verify'
+    dependsOn: Deploy
+    jobs:
+      - job: verify
+        displayName: 'Summarise deployment result'
+        steps:
+          - checkout: self
+
+          - download: current
+            artifact: play-recap
+            displayName: 'Download play recap'
+
+          # site.yml's own verification plays already ran in the Deploy stage;
+          # this stage only confirms and summarises that result.
+          - script: |
+              set -euo pipefail
+              recap="$(Pipeline.Workspace)/play-recap/play-recap.txt"
+              cat "$recap"
+              echo
+              hosts=$(grep -E ':\s+ok=' "$recap" | awk '{print $1}' | paste -sd ', ')
+              bad=$(grep -E ':\s+ok=' "$recap" | grep -Ev 'unreachable=0 +failed=0' || true)
+              if [ -z "$hosts" ] || [ -n "$bad" ]; then
+                echo "##vso[task.logissue type=error]Play recap shows failed or unreachable hosts (or no recap found)."
+                exit 1
+              fi
+              app_ip=$(awk '/^\[frontend\]/{f=1;next} /^\[/{f=0} f && /ansible_host=/{sub(/.*ansible_host=/,""); print $1; exit}' $(inventory))
+              echo "================ EpicBook deployment summary ================"
+              echo "Hosts configured : $hosts"
+              echo "Play recap       : 0 failed, 0 unreachable"
+              echo "Frontend URL     : http://${app_ip}/"
+              echo "============================================================="
+            displayName: 'Confirm play recap and print summary'
