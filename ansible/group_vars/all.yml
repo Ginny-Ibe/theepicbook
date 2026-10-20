@@ -1,0 +1,4 @@
+---
+# Non-sensitive values from the Infrastructure Pipeline outputs (Task 5 handoff)
+backend_private_ip: "10.20.2.200"
+mysql_fqdn: "mysql-epicbook.c21gy6iseth9.us-east-1.rds.amazonaws.com"
