@@ -2,3 +2,13 @@
 # Non-sensitive values from the Infrastructure Pipeline outputs (Task 5 handoff)
 backend_private_ip: "10.20.2.200"
 mysql_fqdn: "mysql-epicbook.c21gy6iseth9.us-east-1.rds.amazonaws.com"
+
+backend_app_port: 3000
+# Must stay "bookstore": the SQL files in db/ hard-code USE bookstore
+db_name: "bookstore"
+
+app_dir: /opt/epicbook
+app_user: ubuntu
+
+# db_admin_username / db_admin_password are never set here. They are passed
+# with -e from the pipeline's Epicbook-mysql-secrets variable group.
